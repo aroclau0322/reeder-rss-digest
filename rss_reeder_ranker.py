@@ -11,6 +11,7 @@ import html
 import json
 import os
 import re
+import socket
 import ssl
 import sys
 import time
@@ -19,6 +20,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -51,6 +53,7 @@ class FeedItem:
     summary: str
     published: str
     page_text: str = ""
+    page_status: str = "rss_only"
 
 
 @dataclass
@@ -62,6 +65,7 @@ class ScoredItem:
     tags: list[str]
     priority: str
     ai_summary: str = ""
+    confidence: str = "medium"
 
 
 def https_context(insecure_tls: bool = False) -> ssl.SSLContext | None:
@@ -79,6 +83,48 @@ def fetch_text(url: str, timeout: int = 20, insecure_tls: bool = False) -> str:
         raw = response.read()
         charset = response.headers.get_content_charset() or "utf-8"
     return raw.decode(charset, errors="replace")
+
+
+def fetch_page_html(
+    url: str,
+    timeout: int,
+    insecure_tls: bool,
+    max_bytes: int,
+) -> tuple[str, bool, str]:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+        },
+    )
+    response = urllib.request.urlopen(request, timeout=timeout, context=https_context(insecure_tls))
+    chunks: list[bytes] = []
+    total = 0
+    complete = True
+    read_note = ""
+    charset = response.headers.get_content_charset() or "utf-8"
+    try:
+        while total < max_bytes:
+            try:
+                chunk = response.read(min(65536, max_bytes - total))
+            except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
+                if not chunks:
+                    raise
+                complete = False
+                read_note = f"页面连接提前结束：{exc}"
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total >= max_bytes:
+            complete = False
+            read_note = f"页面超过 {max_bytes} bytes，已停止继续下载"
+    finally:
+        response.close()
+    return b"".join(chunks).decode(charset, errors="replace"), complete, read_note
 
 
 def load_dotenv(path: Path = Path(".env")) -> None:
@@ -129,6 +175,178 @@ def page_to_text(value: str, limit: int) -> str:
         text = re.sub(pattern, " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return short_text(text, limit)
+
+
+ARTICLE_BLOCK_TAGS = {"p", "div", "section", "article", "main", "h1", "h2", "h3", "h4", "li", "blockquote", "br"}
+ARTICLE_IGNORED_TAGS = {"script", "style", "noscript", "svg", "nav", "header", "footer", "aside", "form", "button"}
+HTML_VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+ARTICLE_CLASS_PRIORITIES = {
+    "article__content": 120,
+    "article-content": 115,
+    "article_content": 115,
+    "article-body": 115,
+    "article_body": 115,
+    "post-content": 110,
+    "entry-content": 110,
+    "detail-content": 105,
+    "rich_media_content": 105,
+}
+PAYWALL_PATTERNS = (
+    "登录后阅读全文",
+    "开通会员阅读全文",
+    "会员专享",
+    "本文为付费内容",
+    "付费后阅读全文",
+    "剩余内容仅会员可见",
+)
+
+
+def normalize_article_text(value: str) -> str:
+    value = html.unescape(value or "")
+    value = re.sub(r"[\t\r\f\v ]+", " ", value)
+    value = re.sub(r" *\n *", "\n", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip()
+
+
+class ArticleHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.depth = 0
+        self.ignored_depth = 0
+        self.active: list[dict[str, Any]] = []
+        self.candidates: list[dict[str, Any]] = []
+        self.json_script_depth = 0
+        self.json_buffer: list[str] = []
+        self.json_scripts: list[str] = []
+
+    def candidate_priority(self, tag: str, attrs: dict[str, str]) -> int:
+        classes = attrs.get("class", "").split()
+        for class_name in classes:
+            if class_name in ARTICLE_CLASS_PRIORITIES:
+                return ARTICLE_CLASS_PRIORITIES[class_name]
+        joined = " ".join(classes).lower()
+        if re.search(r"(?:article|post|entry|detail).*(?:content|body)", joined):
+            return 95
+        if tag == "article":
+            return 90
+        if tag == "main":
+            return 70
+        return 0
+
+    def handle_starttag(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> None:
+        if tag in HTML_VOID_TAGS:
+            if tag == "br" and not self.ignored_depth:
+                for candidate in self.active:
+                    candidate["parts"].append("\n")
+            return
+        self.depth += 1
+        attrs = {key: value or "" for key, value in attrs_list}
+        if tag == "script" and "json" in attrs.get("type", "").lower():
+            self.json_script_depth = self.depth
+            self.json_buffer = []
+        if tag in ARTICLE_IGNORED_TAGS:
+            self.ignored_depth += 1
+        priority = self.candidate_priority(tag, attrs)
+        if priority:
+            self.active.append({"depth": self.depth, "priority": priority, "parts": [], "complete": False})
+        if not self.ignored_depth and tag in ARTICLE_BLOCK_TAGS:
+            for candidate in self.active:
+                candidate["parts"].append("\n")
+
+    def handle_startendtag(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> None:
+        if tag == "br" and not self.ignored_depth:
+            for candidate in self.active:
+                candidate["parts"].append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self.json_script_depth:
+            self.json_buffer.append(data)
+        if self.ignored_depth:
+            return
+        for candidate in self.active:
+            candidate["parts"].append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self.ignored_depth and tag in ARTICLE_BLOCK_TAGS:
+            for candidate in self.active:
+                candidate["parts"].append("\n")
+        ending = [candidate for candidate in self.active if candidate["depth"] == self.depth]
+        for candidate in ending:
+            candidate["complete"] = True
+            self.candidates.append(candidate)
+            self.active.remove(candidate)
+        if tag in ARTICLE_IGNORED_TAGS and self.ignored_depth:
+            self.ignored_depth -= 1
+        if tag == "script" and self.json_script_depth == self.depth:
+            self.json_scripts.append("".join(self.json_buffer))
+            self.json_script_depth = 0
+            self.json_buffer = []
+        self.depth = max(0, self.depth - 1)
+
+    def finish(self) -> list[dict[str, Any]]:
+        self.candidates.extend(self.active)
+        self.active = []
+        return self.candidates
+
+
+def json_article_bodies(value: Any) -> list[str]:
+    bodies: list[str] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key.lower() == "articlebody" and isinstance(child, str):
+                bodies.append(child)
+            else:
+                bodies.extend(json_article_bodies(child))
+    elif isinstance(value, list):
+        for child in value:
+            bodies.extend(json_article_bodies(child))
+    return bodies
+
+
+def extract_article_text(value: str, limit: int, download_complete: bool) -> tuple[str, str]:
+    parser = ArticleHTMLParser()
+    parser.feed(value)
+    candidates = parser.finish()
+    for raw_json in parser.json_scripts:
+        try:
+            for body in json_article_bodies(json.loads(raw_json)):
+                candidates.append(
+                    {
+                        "priority": 108 if len(strip_html(body)) >= 1200 else 60,
+                        "parts": [strip_html(body)],
+                        "complete": True,
+                    }
+                )
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    normalized: list[tuple[int, int, str, bool]] = []
+    for candidate in candidates:
+        text = normalize_article_text("".join(candidate["parts"]))
+        if len(text) >= 200:
+            normalized.append((int(candidate["priority"]), len(text), text, bool(candidate["complete"])))
+
+    if normalized:
+        _, original_length, text, container_complete = max(normalized, key=lambda row: (row[0], row[1]))
+    else:
+        text = page_to_text(value, max(limit, 500))
+        original_length = len(text)
+        container_complete = False
+
+    paywalled = any(pattern in value for pattern in PAYWALL_PATTERNS)
+    truncated = original_length > limit
+    if truncated:
+        text = text[:limit].rstrip() + "…"
+    if paywalled:
+        status = "paywalled"
+    elif truncated or not container_complete:
+        status = "partial"
+    elif download_complete or container_complete:
+        status = "full"
+    else:
+        status = "partial"
+    return text, status
 
 
 def namespace_free(tag: str) -> str:
@@ -326,7 +544,16 @@ def heuristic_score(item: FeedItem, rubric: str) -> ScoredItem:
         tags=[],
         priority="high" if score >= 85 else "medium" if score >= 70 else "low",
         ai_summary=short_text(item.page_text or item.summary, 220),
+        confidence=confidence_for_page_status(item.page_status),
     )
+
+
+def confidence_for_page_status(page_status: str) -> str:
+    if page_status == "full":
+        return "high"
+    if page_status == "partial":
+        return "medium"
+    return "low"
 
 
 def deepseek_chat(
@@ -375,7 +602,8 @@ def score_batch(items: list[FeedItem], rubric: str, api_key: str, model: str) ->
             "feed": item.feed_title,
             "title": item.title,
             "summary": short_text(item.summary, 800),
-            "page_excerpt": short_text(item.page_text, 6500) if item.page_text else "",
+            "page_excerpt": short_text(item.page_text, 15000) if item.page_text else "",
+            "page_status": item.page_status,
             "published": item.published,
             "link": item.link,
         }
@@ -404,6 +632,8 @@ def score_batch(items: list[FeedItem], rubric: str, api_key: str, model: str) ->
             "总结要说明文章主要讲什么、最值得看的点是什么。",
             "不要复述评分标准，不要写空泛赞美。",
             "如果 page_excerpt 为空，就基于 RSS summary 总结，并在措辞上保守。",
+            "page_status=full 表示正文完整；partial 表示正文被截断；paywalled 表示只有付费预览；rss_only 表示没有抓到页面。",
+            "正文不完整时不要假装读过全文，并降低 confidence。",
         ],
         "output_schema": {
             "items": [
@@ -415,6 +645,7 @@ def score_batch(items: list[FeedItem], rubric: str, api_key: str, model: str) ->
                     "tags": ["最多3个中文标签"],
                     "priority": "high|medium|low",
                     "ai_summary": "80-160字中文页面总结",
+                    "confidence": "high|medium|low，表示评分依据的完整度",
                 }
             ]
         },
@@ -452,6 +683,7 @@ def score_batch(items: list[FeedItem], rubric: str, api_key: str, model: str) ->
                 tags=[str(tag) for tag in entry.get("tags", [])][:3] if isinstance(entry.get("tags"), list) else [],
                 priority=str(entry.get("priority") or ("high" if score >= 85 else "medium" if score >= 70 else "low")),
                 ai_summary=str(entry.get("ai_summary") or short_text(item.page_text or item.summary, 220)),
+                confidence=str(entry.get("confidence") or confidence_for_page_status(item.page_status)),
             )
         )
     return scored
@@ -487,19 +719,40 @@ def enrich_items_with_pages(
     timeout: int,
     insecure_tls: bool,
     sleep_seconds: float,
+    retries: int,
 ) -> list[str]:
     errors: list[str] = []
     for item in items:
         parsed = urllib.parse.urlparse(item.link)
         if parsed.scheme not in {"http", "https"}:
             continue
-        try:
-            item.page_text = page_to_text(
-                fetch_text(item.link, timeout=timeout, insecure_tls=insecure_tls),
-                page_char_limit,
-            )
-        except Exception as exc:  # noqa: BLE001 - keep scoring even if a page fails.
-            errors.append(f"{item.link}: {exc}")
+        last_error = ""
+        for attempt in range(max(1, retries + 1)):
+            try:
+                page_html, download_complete, read_note = fetch_page_html(
+                    item.link,
+                    timeout=timeout,
+                    insecure_tls=insecure_tls,
+                    max_bytes=min(2_000_000, max(250_000, page_char_limit * 20)),
+                )
+                item.page_text, item.page_status = extract_article_text(
+                    page_html,
+                    page_char_limit,
+                    download_complete=download_complete,
+                )
+                if item.page_text:
+                    if read_note and item.page_status != "full":
+                        last_error = read_note
+                    break
+                last_error = "页面返回成功，但未提取到正文"
+            except Exception as exc:  # noqa: BLE001 - retry and keep scoring if a page fails.
+                last_error = str(exc)
+            if attempt < retries:
+                time.sleep(min(2.0, 0.5 * (attempt + 1)))
+        if not item.page_text:
+            item.page_status = "rss_only"
+        if last_error:
+            errors.append(f"{item.link}: {last_error}")
         if sleep_seconds:
             time.sleep(sleep_seconds)
     return errors
@@ -529,6 +782,15 @@ def xml_text(parent: ET.Element, tag: str, text: str) -> ET.Element:
     return child
 
 
+def page_status_label(status: str) -> str:
+    return {
+        "full": "全文",
+        "partial": "正文截断",
+        "paywalled": "付费预览",
+        "rss_only": "仅 RSS",
+    }.get(status, status or "未知")
+
+
 def write_rss(
     scored: list[ScoredItem],
     path: Path,
@@ -554,6 +816,8 @@ def write_rss(
         xml_text(node, "pubDate", rss_date(item.published))
         description = (
             f"<p><strong>Score:</strong> {scored_item.score}/100 · {html.escape(scored_item.priority)}</p>"
+            f"<p><strong>Content:</strong> {html.escape(page_status_label(item.page_status))} · "
+            f"评分置信度 {html.escape(scored_item.confidence)}</p>"
             f"<p><strong>Why:</strong> {html.escape(scored_item.reason)}</p>"
             f"<p><strong>Summary:</strong> {html.escape(scored_item.ai_summary)}</p>"
             f"<p><strong>Source:</strong> {html.escape(item.feed_title)}</p>"
@@ -581,6 +845,7 @@ def write_markdown(scored: list[ScoredItem], path: Path, min_score: int, title: 
                 f"## {index}. {scored_item.optimized_title}",
                 "",
                 f"- 分数：{scored_item.score}/100（{scored_item.priority}）",
+                f"- 正文状态：{page_status_label(item.page_status)}；评分置信度：{scored_item.confidence}",
                 f"- 来源：{item.feed_title}",
                 f"- 链接：{item.link}",
                 f"- 理由：{scored_item.reason}",
@@ -661,6 +926,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fetch-pages", action="store_true", help="抓取每篇文章页面正文，再交给 DeepSeek 评分和总结")
     parser.add_argument("--page-char-limit", type=int, default=8000, help="每篇文章最多送入 DeepSeek 的页面文本长度，默认 8000 字符")
     parser.add_argument("--page-timeout", type=int, default=10, help="抓取文章页面的超时时间，默认 10 秒")
+    parser.add_argument("--page-retries", type=int, default=1, help="页面抓取失败后的重试次数，默认 1")
     parser.add_argument("--no-reeder-unique", action="store_true", help="不要给 RSS 条目的链接和 GUID 加去重标记")
     parser.add_argument("--insecure-feed", action="store_true", help="跳过 RSS 订阅源 HTTPS 证书校验；只影响抓取订阅源，不影响 DeepSeek API")
     return parser
@@ -722,6 +988,7 @@ def main() -> int:
             timeout=max(5, args.page_timeout),
             insecure_tls=args.insecure_feed,
             sleep_seconds=max(0, min(args.sleep, 2)),
+            retries=max(0, min(args.page_retries, 3)),
         )
         errors.extend(page_errors)
 

@@ -58,6 +58,10 @@ python3 rss_reeder_ranker.py subscriptions.opml \
   --min-score 75
 ```
 
+页面抓取会优先提取文章正文，并为每篇文章标记正文状态：`full`（全文）、
+`partial`（正文截断）、`paywalled`（付费预览）或 `rss_only`（仅 RSS）。
+DeepSeek 会同时输出评分置信度。公开站点的 JSON 不包含抓取到的正文，只保留状态、评分和总结。
+
 只更新当天新文章：
 
 ```bash

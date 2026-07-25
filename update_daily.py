@@ -114,6 +114,8 @@ def update_source(source: dict[str, object], public_base_url: str) -> str:
         str(source.get("page_char_limit", 5000)),
         "--page-timeout",
         str(source.get("page_timeout", 5)),
+        "--page-retries",
+        str(source.get("page_retries", 1)),
         "--fetch-pages",
         "--today",
         "--today-timezone",
@@ -153,6 +155,7 @@ def load_scored_items(path: Path) -> list[ScoredItem]:
                 tags=[str(tag) for tag in row.get("tags", [])][:3],
                 priority=str(row.get("priority", "low")),
                 ai_summary=str(row.get("ai_summary", "")),
+                confidence=str(row.get("confidence", "medium")),
             )
         )
     return scored
@@ -241,6 +244,17 @@ def write_index(publish_root: Path, sources: list[dict[str, object]], article_co
     (publish_root / ".nojekyll").write_text("", encoding="utf-8")
 
 
+def remove_public_page_text(path: Path) -> None:
+    if not path.exists():
+        return
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    for row in rows:
+        item = row.get("item")
+        if isinstance(item, dict):
+            item.pop("page_text", None)
+    path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def publish_reeder_outputs(
     publish_root: Path,
     sources: list[dict[str, object]],
@@ -255,8 +269,11 @@ def publish_reeder_outputs(
 
     shutil.copy2(DAILY_DIGEST_DIR / "high_score.xml", publish_root / "high_score.xml")
     shutil.copytree(DAILY_DIGEST_DIR, publish_root / "daily_digest")
+    remove_public_page_text(publish_root / "daily_digest" / "scored_items.json")
     for source in sources:
-        shutil.copytree(source_output_dir(source), publish_root / "sources" / str(source["name"]))
+        public_source_dir = publish_root / "sources" / str(source["name"])
+        shutil.copytree(source_output_dir(source), public_source_dir)
+        remove_public_page_text(public_source_dir / "scored_items.json")
     write_index(publish_root, sources, article_count)
     return f"## publish\nReeder 发布目录已更新：{publish_root.resolve()}\n"
 

@@ -41,8 +41,9 @@
     "limit": 30,
     "max_per_feed": 20,
     "batch_size": 3,
-    "page_char_limit": 5000,
-    "page_timeout": 5
+    "page_char_limit": 15000,
+    "page_timeout": 12,
+    "page_retries": 2
   },
   {
     "name": "ahhhhfs",
