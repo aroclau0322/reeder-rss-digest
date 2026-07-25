@@ -1,0 +1,57 @@
+name: 更新并发布 Reeder RSS
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 20 * * *"
+      timezone: "Asia/Shanghai"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      PUBLIC_BASE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+      TZ: Asia/Shanghai
+    steps:
+      - name: 读取项目
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        run: python -m pip install -r requirements.txt
+
+      - name: 抓取、评分并生成 RSS
+        run: python update_daily.py --publish-dir site --require-api-key
+
+      - name: 准备 GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: 上传 RSS
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: 发布 GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

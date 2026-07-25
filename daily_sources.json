@@ -1,0 +1,69 @@
+[
+  {
+    "name": "sspai",
+    "url": "https://sspai.com/feed",
+    "output_dir": "output/reeder_test",
+    "min_score": 75,
+    "limit": 30,
+    "max_per_feed": 20,
+    "batch_size": 3,
+    "page_char_limit": 5000,
+    "page_timeout": 5
+  },
+  {
+    "name": "mifaw_36kr_hot",
+    "url": "https://rss.mifaw.com/articles/5c8bb11a3c41f61efd36683e/5c91d2e23882afa09dff4901",
+    "output_dir": "output/mifaw",
+    "min_score": 75,
+    "limit": 30,
+    "max_per_feed": 10,
+    "batch_size": 3,
+    "page_char_limit": 5000,
+    "page_timeout": 5
+  },
+  {
+    "name": "digitaling_articles_projects",
+    "url": "http://www.digitaling.com/rss",
+    "output_dir": "output/digitaling",
+    "min_score": 75,
+    "limit": 30,
+    "max_per_feed": 30,
+    "batch_size": 3,
+    "page_char_limit": 5000,
+    "page_timeout": 5,
+    "include_url_paths": ["/articles/", "/projects/"]
+  },
+  {
+    "name": "huxiu",
+    "url": "https://rss.huxiu.com/",
+    "output_dir": "output/huxiu",
+    "min_score": 75,
+    "limit": 30,
+    "max_per_feed": 20,
+    "batch_size": 3,
+    "page_char_limit": 5000,
+    "page_timeout": 5
+  },
+  {
+    "name": "ahhhhfs",
+    "url": "https://www.ahhhhfs.com/feed/",
+    "output_dir": "output/ahhhhfs",
+    "min_score": 75,
+    "limit": 30,
+    "max_per_feed": 12,
+    "batch_size": 3,
+    "page_char_limit": 5000,
+    "page_timeout": 5
+  },
+  {
+    "name": "zhihu_daily",
+    "url": "https://rss.mifaw.com/articles/5c8bb11a3c41f61efd36683e/5c919dc93882afa09dff3fc7",
+    "output_dir": "output/zhihu_daily",
+    "min_score": 75,
+    "limit": 30,
+    "max_per_feed": 20,
+    "batch_size": 3,
+    "page_char_limit": 5000,
+    "page_timeout": 5
+  }
+]

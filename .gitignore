@@ -1,0 +1,10 @@
+.env
+.DS_Store
+output/
+cache/
+logs/
+site/
+launchd/
+sspai_feed.xml
+*.pyc
+__pycache__/
