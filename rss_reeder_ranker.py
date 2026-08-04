@@ -713,14 +713,29 @@ def score_items(
     if not api_key:
         return [heuristic_score(item, rubric) for item in items]
 
+    def score_with_retry(batch: list[FeedItem]) -> list[ScoredItem]:
+        last_error: Exception | None = None
+        attempts = 2 if len(batch) > 1 else 3
+        for attempt in range(attempts):
+            try:
+                return score_batch(batch, rubric, api_key, model)
+            except Exception as exc:  # noqa: BLE001 - malformed model output and transient API errors are retried.
+                last_error = exc
+                if attempt + 1 < attempts:
+                    time.sleep(1.0 * (attempt + 1))
+
+        if len(batch) > 1:
+            midpoint = max(1, len(batch) // 2)
+            return [
+                *score_with_retry(batch[:midpoint]),
+                *score_with_retry(batch[midpoint:]),
+            ]
+        raise RuntimeError(f"DeepSeek 单篇评分连续失败：{batch[0].title}") from last_error
+
     scored: list[ScoredItem] = []
     for start in range(0, len(items), batch_size):
         batch = items[start : start + batch_size]
-        try:
-            scored.extend(score_batch(batch, rubric, api_key, model))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"DeepSeek API 请求失败：HTTP {exc.code} {detail}") from exc
+        scored.extend(score_with_retry(batch))
         if sleep_seconds and start + batch_size < len(items):
             time.sleep(sleep_seconds)
     return scored

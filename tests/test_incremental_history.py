@@ -1,7 +1,9 @@
 import datetime as dt
+import json
 import unittest
+from unittest import mock
 
-from rss_reeder_ranker import FeedItem, FeedSource, ScoredItem, parse_feed
+from rss_reeder_ranker import FeedItem, FeedSource, ScoredItem, parse_feed, score_items
 from update_daily import merge_scored_history
 
 
@@ -63,6 +65,33 @@ class IncrementalHistoryTests(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0].item.id, "duplicate-new")
         self.assertEqual(merged[0].score, 91)
+
+    def test_malformed_batch_is_retried_and_split_into_single_articles(self) -> None:
+        items = [
+            scored_item(str(index), f"https://example.com/{index}", "Tue, 04 Aug 2026 10:00:00 +0000").item
+            for index in range(3)
+        ]
+        batch_sizes: list[int] = []
+
+        def fake_score_batch(
+            batch: list[FeedItem],
+            _rubric: str,
+            _api_key: str,
+            _model: str,
+        ) -> list[ScoredItem]:
+            batch_sizes.append(len(batch))
+            if len(batch) > 1:
+                raise json.JSONDecodeError("truncated", "{", 1)
+            item = batch[0]
+            return [scored_item(item.id, item.link, item.published, 88)]
+
+        with mock.patch("rss_reeder_ranker.score_batch", side_effect=fake_score_batch), mock.patch(
+            "rss_reeder_ranker.time.sleep"
+        ):
+            scored = score_items(items, "测试标准", "key", "model", batch_size=3, sleep_seconds=0)
+
+        self.assertEqual(len(scored), 3)
+        self.assertEqual(batch_sizes, [3, 3, 1, 2, 2, 1, 1])
 
 
 if __name__ == "__main__":
