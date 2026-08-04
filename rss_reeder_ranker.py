@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as dt
 import email.utils
 import hashlib
@@ -451,7 +452,13 @@ def dedupe_sources(sources: list[FeedSource]) -> list[FeedSource]:
     return unique
 
 
-def parse_feed(source: FeedSource, text: str, max_per_feed: int, since: dt.datetime | None) -> list[FeedItem]:
+def parse_feed(
+    source: FeedSource,
+    text: str,
+    max_per_feed: int,
+    since: dt.datetime | None,
+    stats: dict[str, int] | None = None,
+) -> list[FeedItem]:
     root = ET.fromstring(text)
     root_name = namespace_free(root.tag)
     channel = root.find("channel") if root_name == "rss" else None
@@ -466,6 +473,9 @@ def parse_feed(source: FeedSource, text: str, max_per_feed: int, since: dt.datet
         items = [child for child in list(root) if namespace_free(child.tag) == "entry"]
     else:
         items = [child for child in root.iter() if namespace_free(child.tag) in {"item", "entry"}]
+
+    if stats is not None:
+        stats["raw_feed_items"] = stats.get("raw_feed_items", 0) + len(items)
 
     parsed_items: list[FeedItem] = []
     for node in items:
@@ -490,9 +500,12 @@ def parse_feed(source: FeedSource, text: str, max_per_feed: int, since: dt.datet
                 published=published,
             )
         )
-        if len(parsed_items) >= max_per_feed:
-            break
-    return parsed_items
+    if stats is not None:
+        stats["after_time_filter"] = stats.get("after_time_filter", 0) + len(parsed_items)
+    capped_items = parsed_items[:max_per_feed]
+    if stats is not None:
+        stats["after_source_cap"] = stats.get("after_source_cap", 0) + len(capped_items)
+    return capped_items
 
 
 def filter_items(
@@ -720,12 +733,12 @@ def enrich_items_with_pages(
     insecure_tls: bool,
     sleep_seconds: float,
     retries: int,
+    workers: int,
 ) -> list[str]:
-    errors: list[str] = []
-    for item in items:
+    def enrich_item(item: FeedItem) -> str:
         parsed = urllib.parse.urlparse(item.link)
         if parsed.scheme not in {"http", "https"}:
-            continue
+            return ""
         last_error = ""
         for attempt in range(max(1, retries + 1)):
             try:
@@ -751,10 +764,17 @@ def enrich_items_with_pages(
                 time.sleep(min(2.0, 0.5 * (attempt + 1)))
         if not item.page_text:
             item.page_status = "rss_only"
-        if last_error:
-            errors.append(f"{item.link}: {last_error}")
         if sleep_seconds:
             time.sleep(sleep_seconds)
+        return f"{item.link}: {last_error}" if last_error else ""
+
+    errors: list[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        futures = [executor.submit(enrich_item, item) for item in items]
+        for future in concurrent.futures.as_completed(futures):
+            error = future.result()
+            if error:
+                errors.append(error)
     return errors
 
 
@@ -884,6 +904,13 @@ def write_json(scored: list[ScoredItem], path: Path) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def write_run_stats(stats: dict[str, Any], output_dir: Path) -> None:
+    (output_dir / "run_stats.json").write_text(
+        json.dumps(stats, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def load_rubric(args: argparse.Namespace) -> str:
     parts: list[str] = []
     if args.rubric_file:
@@ -907,6 +934,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-per-feed", type=int, default=12, help="每个源最多抓取多少篇，默认 12")
     parser.add_argument("--limit", type=int, default=40, help="最终最多输出多少篇，默认 40")
     parser.add_argument("--days", type=int, default=21, help="只看最近多少天；0 表示不过滤，默认 21")
+    parser.add_argument("--since", default="", help="只看此 ISO 8601 时间之后发布的文章")
     parser.add_argument("--today", action="store_true", help="只看指定时区当天 00:00 之后发布的文章")
     parser.add_argument(
         "--today-timezone",
@@ -927,6 +955,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--page-char-limit", type=int, default=8000, help="每篇文章最多送入 DeepSeek 的页面文本长度，默认 8000 字符")
     parser.add_argument("--page-timeout", type=int, default=10, help="抓取文章页面的超时时间，默认 10 秒")
     parser.add_argument("--page-retries", type=int, default=1, help="页面抓取失败后的重试次数，默认 1")
+    parser.add_argument("--page-workers", type=int, default=1, help="并发抓取文章页面的数量，默认 1")
     parser.add_argument("--no-reeder-unique", action="store_true", help="不要给 RSS 条目的链接和 GUID 加去重标记")
     parser.add_argument("--insecure-feed", action="store_true", help="跳过 RSS 订阅源 HTTPS 证书校验；只影响抓取订阅源，不影响 DeepSeek API")
     return parser
@@ -947,7 +976,16 @@ def main() -> int:
         return 2
 
     since = None
-    if args.today:
+    if args.since:
+        try:
+            since = dt.datetime.fromisoformat(args.since.replace("Z", "+00:00"))
+        except ValueError as exc:
+            parser.error(f"无法解析 --since：{args.since}")
+            raise AssertionError from exc
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=dt.timezone.utc)
+        since = since.astimezone(dt.timezone.utc)
+    elif args.today:
         try:
             today_timezone = ZoneInfo(args.today_timezone)
         except ZoneInfoNotFoundError as exc:
@@ -959,6 +997,17 @@ def main() -> int:
     elif args.days > 0:
         since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=args.days)
 
+    run_stats: dict[str, Any] = {
+        "since": since.isoformat() if since else "",
+        "raw_feed_items": 0,
+        "after_time_filter": 0,
+        "after_source_cap": 0,
+        "after_channel_filter": 0,
+        "scored": 0,
+        "high_score": 0,
+        "page_status": {},
+        "errors": 0,
+    }
     items: list[FeedItem] = []
     errors: list[str] = []
     for source in sources:
@@ -966,18 +1015,23 @@ def main() -> int:
             input_is_url = urllib.parse.urlparse(args.input).scheme in {"http", "https"}
             use_input_text = len(sources) == 1 and (source.url == args.input or not input_is_url)
             feed_text = source_text if use_input_text else fetch_text(source.url, insecure_tls=args.insecure_feed)
-            items.extend(parse_feed(source, feed_text, args.max_per_feed, since))
+            items.extend(parse_feed(source, feed_text, args.max_per_feed, since, run_stats))
         except Exception as exc:  # noqa: BLE001 - keep going across many feeds.
             errors.append(f"{source.url}: {exc}")
 
     if not items:
+        run_stats["errors"] = len(errors)
+        write_run_stats(run_stats, output_dir)
         print("没有抓到可评分的文章。", file=sys.stderr)
         for error in errors:
             print(f"- {error}", file=sys.stderr)
         return 2
 
     items = filter_items(items, args.include_url_path, args.include_title_prefix)
+    run_stats["after_channel_filter"] = len(items)
     if not items:
+        run_stats["errors"] = len(errors)
+        write_run_stats(run_stats, output_dir)
         print("过滤后没有可评分的文章。", file=sys.stderr)
         return 2
 
@@ -989,8 +1043,14 @@ def main() -> int:
             insecure_tls=args.insecure_feed,
             sleep_seconds=max(0, min(args.sleep, 2)),
             retries=max(0, min(args.page_retries, 3)),
+            workers=max(1, min(args.page_workers, 8)),
         )
         errors.extend(page_errors)
+
+    page_statuses: dict[str, int] = {}
+    for item in items:
+        page_statuses[item.page_status] = page_statuses.get(item.page_status, 0) + 1
+    run_stats["page_status"] = page_statuses
 
     scored = score_items(
         items=items,
@@ -1002,6 +1062,9 @@ def main() -> int:
     )
     scored.sort(key=lambda row: row.score, reverse=True)
     selected = [row for row in scored if row.score >= args.min_score][: args.limit]
+    run_stats["scored"] = len(scored)
+    run_stats["high_score"] = len(selected)
+    run_stats["errors"] = len(errors)
 
     write_rss(
         selected,
@@ -1015,6 +1078,7 @@ def main() -> int:
     write_markdown(scored, output_dir / "all_articles.md", 0, title="DeepSeek RSS 全量评分与总结")
     write_opml(selected, output_dir / "reeder_high_score_sources.opml")
     write_json(scored, output_dir / "scored_items.json")
+    write_run_stats(run_stats, output_dir)
 
     print(f"订阅源：{len(sources)} 个")
     print(f"候选文章：{len(items)} 篇")

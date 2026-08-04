@@ -5,10 +5,12 @@
     "output_dir": "output/reeder_test",
     "min_score": 75,
     "limit": 30,
-    "max_per_feed": 20,
+    "max_per_feed": 30,
     "batch_size": 3,
     "page_char_limit": 5000,
-    "page_timeout": 5
+    "page_timeout": 5,
+    "page_workers": 4,
+    "history_limit": 100
   },
   {
     "name": "mifaw_36kr_hot",
@@ -16,10 +18,12 @@
     "output_dir": "output/mifaw",
     "min_score": 75,
     "limit": 30,
-    "max_per_feed": 10,
+    "max_per_feed": 40,
     "batch_size": 3,
     "page_char_limit": 5000,
-    "page_timeout": 5
+    "page_timeout": 5,
+    "page_workers": 4,
+    "history_limit": 100
   },
   {
     "name": "digitaling_articles_projects",
@@ -27,10 +31,12 @@
     "output_dir": "output/digitaling",
     "min_score": 75,
     "limit": 30,
-    "max_per_feed": 30,
+    "max_per_feed": 60,
     "batch_size": 3,
     "page_char_limit": 5000,
     "page_timeout": 5,
+    "page_workers": 4,
+    "history_limit": 100,
     "include_url_paths": ["/articles/", "/projects/"]
   },
   {
@@ -39,11 +45,13 @@
     "output_dir": "output/huxiu",
     "min_score": 75,
     "limit": 30,
-    "max_per_feed": 20,
+    "max_per_feed": 160,
     "batch_size": 3,
     "page_char_limit": 15000,
     "page_timeout": 12,
-    "page_retries": 2
+    "page_retries": 2,
+    "page_workers": 4,
+    "history_limit": 150
   },
   {
     "name": "ahhhhfs",
@@ -51,10 +59,12 @@
     "output_dir": "output/ahhhhfs",
     "min_score": 75,
     "limit": 30,
-    "max_per_feed": 12,
+    "max_per_feed": 30,
     "batch_size": 3,
     "page_char_limit": 5000,
-    "page_timeout": 5
+    "page_timeout": 5,
+    "page_workers": 4,
+    "history_limit": 100
   },
   {
     "name": "zhihu_daily",
@@ -62,9 +72,11 @@
     "output_dir": "output/zhihu_daily",
     "min_score": 75,
     "limit": 30,
-    "max_per_feed": 20,
+    "max_per_feed": 40,
     "batch_size": 3,
     "page_char_limit": 5000,
-    "page_timeout": 5
+    "page_timeout": 5,
+    "page_workers": 4,
+    "history_limit": 100
   }
 ]

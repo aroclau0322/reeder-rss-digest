@@ -62,12 +62,12 @@ python3 rss_reeder_ranker.py subscriptions.opml \
 `partial`（正文截断）、`paywalled`（付费预览）或 `rss_only`（仅 RSS）。
 DeepSeek 会同时输出评分置信度。公开站点的 JSON 不包含抓取到的正文，只保留状态、评分和总结。
 
-只更新当天新文章：
+只更新某个时间点之后的新文章：
 
 ```bash
 python3 rss_reeder_ranker.py subscriptions.opml \
   --fetch-pages \
-  --today
+  --since 2026-08-03T12:00:00+00:00
 ```
 
 更新 `daily_sources.json` 中登记的所有源：
@@ -76,12 +76,14 @@ python3 rss_reeder_ranker.py subscriptions.opml \
 python3 update_daily.py
 ```
 
-默认会在上海时区的当天范围内筛选文章，并额外生成一个统一的“今日高分信息源”。
+默认会从每个订阅源上次成功更新的时间继续抓取；首次运行回看 48 小时。结果按链接去重，
+保留最近 3 天，并额外生成一个统一的“近 3 日高分信息源”。
 本地统一订阅地址仍由原来的发布目录提供；云端会使用站点根目录下的 `high_score.xml`。
 
 ## 不依赖 Mac 的云端更新
 
-项目包含 `.github/workflows/publish.yml`，可由 GitHub Actions 每天上海时间 20:00 自动运行，
+项目包含 `.github/workflows/publish.yml`，可由 GitHub Actions 每天上海时间 20:17 自动运行，
+并在 23:17 补偿更新一次，
 再通过 GitHub Pages 提供长期在线的 RSS 地址。
 
 仓库上线后需要完成两项设置：

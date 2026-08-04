@@ -18,6 +18,7 @@ from rss_reeder_ranker import (
     FeedItem,
     ScoredItem,
     load_dotenv,
+    parse_datetime,
     write_json,
     write_markdown,
     write_opml,
@@ -33,8 +34,10 @@ OUTPUT_DIR = ROOT / "output"
 DEFAULT_PUBLISH_ROOT = Path("/Users/aroc/Public/reeder-rss-root")
 DAILY_DIGEST_DIR = OUTPUT_DIR / "daily_digest"
 DEFAULT_MIN_SCORE = 75
-DEFAULT_DIGEST_LIMIT = 50
-SHANGHAI_TIMEZONE = "Asia/Shanghai"
+DEFAULT_DIGEST_LIMIT = 100
+HISTORY_DAYS = 3
+INITIAL_LOOKBACK_HOURS = 48
+MAX_SOURCE_HISTORY = 500
 
 
 def run(command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -78,19 +81,75 @@ def source_output_dir(source: dict[str, object]) -> Path:
     return output_dir if output_dir.is_absolute() else ROOT / output_dir
 
 
+def utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def parse_state_time(value: object) -> dt.datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def read_json_file(path: Path) -> object | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def load_public_json(publish_root: Path, public_base_url: str, relative_path: str) -> object | None:
+    local_payload = read_json_file(publish_root / relative_path)
+    if local_payload is not None:
+        return local_payload
+    if not public_base_url:
+        return None
+    result = run(
+        [
+            "curl",
+            "-fsSL",
+            "--retry",
+            "1",
+            "--connect-timeout",
+            "8",
+            "--max-time",
+            "20",
+            f"{public_base_url.rstrip('/')}/{relative_path}",
+        ]
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
 def write_empty_source_output(source: dict[str, object], public_base_url: str) -> None:
     output_dir = source_output_dir(source)
     output_dir.mkdir(parents=True, exist_ok=True)
     min_score = int(source.get("min_score", DEFAULT_MIN_SCORE))
-    title = f"{source['name']} 今日高分 RSS"
+    title = f"{source['name']} 近 {HISTORY_DAYS} 日高分 RSS"
     write_rss([], output_dir / "high_score.xml", title, min_score, True, public_base_url)
     write_markdown([], output_dir / "top_articles.md", min_score, title=title)
-    write_markdown([], output_dir / "all_articles.md", 0, title=f"{source['name']} 今日全量评分")
+    write_markdown([], output_dir / "all_articles.md", 0, title=f"{source['name']} 近 {HISTORY_DAYS} 日全量评分")
     write_opml([], output_dir / "reeder_high_score_sources.opml")
     write_json([], output_dir / "scored_items.json")
 
 
-def update_source(source: dict[str, object], public_base_url: str) -> str:
+def update_source(
+    source: dict[str, object],
+    public_base_url: str,
+    since: dt.datetime,
+) -> tuple[str, dict[str, object]]:
     name = str(source["name"])
     url = str(source["url"])
     feed_file = download_feed(name, url)
@@ -116,10 +175,11 @@ def update_source(source: dict[str, object], public_base_url: str) -> str:
         str(source.get("page_timeout", 5)),
         "--page-retries",
         str(source.get("page_retries", 1)),
+        "--page-workers",
+        str(source.get("page_workers", 4)),
         "--fetch-pages",
-        "--today",
-        "--today-timezone",
-        SHANGHAI_TIMEZONE,
+        "--since",
+        since.astimezone(dt.timezone.utc).isoformat(),
     ]
     if public_base_url:
         command.extend(
@@ -133,19 +193,26 @@ def update_source(source: dict[str, object], public_base_url: str) -> str:
     for prefix in source.get("include_title_prefixes", []):
         command.extend(["--include-title-prefix", str(prefix)])
     result = run(command)
+    stats_payload = read_json_file(source_output_dir(source) / "run_stats.json")
+    stats = stats_payload if isinstance(stats_payload, dict) else {}
     if result.returncode != 0:
         if "没有抓到可评分的文章" in result.stdout or "过滤后没有可评分的文章" in result.stdout:
             write_empty_source_output(source, public_base_url)
-            return f"## {name}\n当天暂无新文章，已发布空的今日源。\n{result.stdout.strip()}\n"
+            return f"## {name}\n本轮暂无新文章，继续保留历史结果。\n{result.stdout.strip()}\n", stats
         raise RuntimeError(f"更新失败：{name}\n{result.stdout}")
-    return f"## {name}\n{result.stdout.strip()}\n"
+    return f"## {name}\n{result.stdout.strip()}\n", stats
 
 
-def load_scored_items(path: Path) -> list[ScoredItem]:
-    rows = json.loads(path.read_text(encoding="utf-8"))
+def scored_items_from_rows(rows: object) -> list[ScoredItem]:
+    if not isinstance(rows, list):
+        return []
     scored: list[ScoredItem] = []
     for row in rows:
+        if not isinstance(row, dict):
+            continue
         item_data = row.get("item", {})
+        if not isinstance(item_data, dict):
+            continue
         scored.append(
             ScoredItem(
                 item=FeedItem(**item_data),
@@ -161,6 +228,10 @@ def load_scored_items(path: Path) -> list[ScoredItem]:
     return scored
 
 
+def load_scored_items(path: Path) -> list[ScoredItem]:
+    return scored_items_from_rows(read_json_file(path))
+
+
 def canonical_item_key(item: FeedItem) -> str:
     if not item.link:
         return item.id
@@ -169,6 +240,56 @@ def canonical_item_key(item: FeedItem) -> str:
         [(key, value) for key, value in urllib.parse.parse_qsl(parsed.query) if not key.lower().startswith("utm_")]
     )
     return urllib.parse.urlunparse(parsed._replace(query=clean_query, fragment="")).rstrip("/")
+
+
+def scored_sort_key(scored_item: ScoredItem) -> tuple[float, int, str]:
+    published = parse_datetime(scored_item.item.published)
+    timestamp = published.timestamp() if published else 0.0
+    return timestamp, scored_item.score, scored_item.item.id
+
+
+def merge_scored_history(
+    previous: list[ScoredItem],
+    current: list[ScoredItem],
+    cutoff: dt.datetime,
+    limit: int = MAX_SOURCE_HISTORY,
+) -> list[ScoredItem]:
+    by_article: dict[str, ScoredItem] = {}
+    for scored_item in [*previous, *current]:
+        published = parse_datetime(scored_item.item.published)
+        if published and published < cutoff:
+            continue
+        by_article[canonical_item_key(scored_item.item)] = scored_item
+    return sorted(by_article.values(), key=scored_sort_key, reverse=True)[:limit]
+
+
+def write_source_history(
+    source: dict[str, object],
+    scored: list[ScoredItem],
+    public_base_url: str,
+) -> tuple[int, int]:
+    output_dir = source_output_dir(source)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    min_score = int(source.get("min_score", DEFAULT_MIN_SCORE))
+    history_limit = int(source.get("history_limit", 100))
+    selected = sorted(
+        [row for row in scored if row.score >= min_score],
+        key=scored_sort_key,
+        reverse=True,
+    )[:history_limit]
+    name = str(source["name"])
+    title = f"{name} 近 {HISTORY_DAYS} 日高分 RSS"
+    channel_link = (
+        f"{public_base_url.rstrip('/')}/sources/{name}/high_score.xml"
+        if public_base_url
+        else "http://127.0.0.1/rss-reeder-ranker"
+    )
+    write_rss(selected, output_dir / "high_score.xml", title, min_score, True, channel_link)
+    write_markdown(selected, output_dir / "top_articles.md", min_score, title=title)
+    write_markdown(scored, output_dir / "all_articles.md", 0, title=f"{name} 近 {HISTORY_DAYS} 日全量评分")
+    write_opml(selected, output_dir / "reeder_high_score_sources.opml")
+    write_json(scored, output_dir / "scored_items.json")
+    return len(scored), len(selected)
 
 
 def build_daily_digest(
@@ -200,12 +321,17 @@ def build_daily_digest(
     write_rss(
         selected,
         DAILY_DIGEST_DIR / "high_score.xml",
-        "今日高分信息源",
+        f"近 {HISTORY_DAYS} 日高分信息源",
         DEFAULT_MIN_SCORE,
         True,
         channel_link=channel_link,
     )
-    write_markdown(selected, DAILY_DIGEST_DIR / "top_articles.md", DEFAULT_MIN_SCORE, title="今日高分信息源")
+    write_markdown(
+        selected,
+        DAILY_DIGEST_DIR / "top_articles.md",
+        DEFAULT_MIN_SCORE,
+        title=f"近 {HISTORY_DAYS} 日高分信息源",
+    )
     write_json(selected, DAILY_DIGEST_DIR / "scored_items.json")
     write_opml(selected, DAILY_DIGEST_DIR / "reeder_high_score_sources.opml")
     return selected
@@ -223,7 +349,7 @@ def write_index(publish_root: Path, sources: list[dict[str, object]], article_co
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>今日高分信息源</title>
+  <title>近 {HISTORY_DAYS} 日高分信息源</title>
   <style>
     body {{ max-width: 720px; margin: 48px auto; padding: 0 20px; font: 16px/1.65 system-ui, sans-serif; color: #202124; }}
     h1 {{ font-size: 28px; }}
@@ -232,7 +358,7 @@ def write_index(publish_root: Path, sources: list[dict[str, object]], article_co
   </style>
 </head>
 <body>
-  <h1>今日高分信息源</h1>
+  <h1>近 {HISTORY_DAYS} 日高分信息源</h1>
   <p><a href="high_score.xml">订阅统一高分 RSS</a></p>
   <p class="meta">本次精选 {article_count} 篇，更新时间：{html.escape(updated)}</p>
   <h2>独立来源</h2>
@@ -259,6 +385,7 @@ def publish_reeder_outputs(
     publish_root: Path,
     sources: list[dict[str, object]],
     article_count: int,
+    state: dict[str, object],
 ) -> str:
     resolved_root = publish_root.resolve()
     if resolved_root == ROOT.resolve() or resolved_root == Path("/"):
@@ -274,6 +401,10 @@ def publish_reeder_outputs(
         public_source_dir = publish_root / "sources" / str(source["name"])
         shutil.copytree(source_output_dir(source), public_source_dir)
         remove_public_page_text(public_source_dir / "scored_items.json")
+    (publish_root / "state.json").write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     write_index(publish_root, sources, article_count)
     return f"## publish\nReeder 发布目录已更新：{publish_root.resolve()}\n"
 
@@ -311,24 +442,92 @@ def main() -> int:
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     sources = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    publish_root = Path(args.publish_dir)
+    previous_state_payload = load_public_json(publish_root, args.public_base_url, "state.json")
+    previous_state = previous_state_payload if isinstance(previous_state_payload, dict) else {}
+    previous_source_state_payload = previous_state.get("sources", {})
+    previous_source_state = previous_source_state_payload if isinstance(previous_source_state_payload, dict) else {}
+    previous_items: dict[str, list[ScoredItem]] = {}
+    for source in sources:
+        name = str(source["name"])
+        payload = load_public_json(
+            publish_root,
+            args.public_base_url,
+            f"sources/{name}/scored_items.json",
+        )
+        previous_items[name] = scored_items_from_rows(payload)
+
     prepare_generated_outputs(sources)
+    run_started = utc_now()
+    history_cutoff = run_started - dt.timedelta(days=HISTORY_DAYS)
     started = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     sections = [f"# Daily RSS update\n\nStarted: {started}\n"]
     failures: list[str] = []
     successful_sources = 0
+    state_sources: dict[str, object] = {}
     for source in sources:
+        name = str(source["name"])
+        prior_state_payload = previous_source_state.get(name, {})
+        prior_state = prior_state_payload if isinstance(prior_state_payload, dict) else {}
+        since = parse_state_time(prior_state.get("last_successful_at"))
+        if since is None:
+            since = run_started - dt.timedelta(hours=INITIAL_LOOKBACK_HOURS)
         try:
-            sections.append(update_source(source, args.public_base_url))
+            source_log, stats = update_source(source, args.public_base_url, since)
+            current_items = load_scored_items(source_output_dir(source) / "scored_items.json")
+            merged = merge_scored_history(previous_items[name], current_items, history_cutoff)
+            retained_count, retained_high_score = write_source_history(source, merged, args.public_base_url)
+            counts = {
+                **stats,
+                "new_scored": len(current_items),
+                "retained_history": retained_count,
+                "retained_high_score": retained_high_score,
+            }
+            state_sources[name] = {
+                "last_successful_at": run_started.isoformat(),
+                "since": since.isoformat(),
+                "status": "success",
+                "counts": counts,
+            }
+            sections.append(source_log)
+            sections.append(
+                "统计："
+                f"原始 {counts.get('raw_feed_items', 0)}，"
+                f"时间过滤后 {counts.get('after_time_filter', 0)}，"
+                f"源上限后 {counts.get('after_source_cap', 0)}，"
+                f"频道过滤后 {counts.get('after_channel_filter', 0)}，"
+                f"本轮评分 {len(current_items)}，"
+                f"三日保留 {retained_count}，其中高分 {retained_high_score}。\n"
+            )
             successful_sources += 1
         except Exception as exc:  # noqa: BLE001 - update other feeds even if one fails.
             failures.append(str(exc))
-            write_empty_source_output(source, args.public_base_url)
-            sections.append(f"## {source.get('name', 'unknown')}\nFAILED\n{exc}\n")
+            retained = merge_scored_history(previous_items[name], [], history_cutoff)
+            retained_count, retained_high_score = write_source_history(source, retained, args.public_base_url)
+            state_sources[name] = {
+                "last_successful_at": prior_state.get("last_successful_at", ""),
+                "since": since.isoformat(),
+                "status": "failed",
+                "error": str(exc),
+                "counts": {
+                    "retained_history": retained_count,
+                    "retained_high_score": retained_high_score,
+                },
+            }
+            sections.append(f"## {name}\nFAILED，已保留上次结果\n{exc}\n")
+
+    state: dict[str, object] = {
+        "version": 1,
+        "updated_at": utc_now().isoformat(),
+        "history_days": HISTORY_DAYS,
+        "initial_lookback_hours": INITIAL_LOOKBACK_HOURS,
+        "sources": state_sources,
+    }
 
     try:
         selected = build_daily_digest(sources, args.public_base_url, max(1, args.digest_limit))
-        sections.append(f"## daily_digest\n统一精选 {len(selected)} 篇。\n")
-        sections.append(publish_reeder_outputs(Path(args.publish_dir), sources, len(selected)))
+        sections.append(f"## daily_digest\n近 {HISTORY_DAYS} 日统一精选 {len(selected)} 篇。\n")
+        sections.append(publish_reeder_outputs(publish_root, sources, len(selected), state))
     except Exception as exc:  # noqa: BLE001 - make publishing failures visible.
         failures.append(str(exc))
         sections.append(f"## publish\nFAILED\n{exc}\n")

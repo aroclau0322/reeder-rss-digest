@@ -3,7 +3,9 @@ name: 更新并发布 Reeder RSS
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 20 * * *"
+    - cron: "17 20 * * *"
+      timezone: "Asia/Shanghai"
+    - cron: "17 23 * * *"
       timezone: "Asia/Shanghai"
 
 permissions:
@@ -21,7 +23,7 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
       PUBLIC_BASE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
@@ -43,6 +45,13 @@ jobs:
 
       - name: 抓取、评分并生成 RSS
         run: python update_daily.py --publish-dir site --require-api-key
+
+      - name: 输出分阶段统计
+        if: always()
+        run: |
+          if [ -f logs/daily_update_latest.md ]; then
+            cat logs/daily_update_latest.md
+          fi
 
       - name: 准备 GitHub Pages
         uses: actions/configure-pages@v5
