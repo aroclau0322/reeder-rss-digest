@@ -1,10 +1,12 @@
 import datetime as dt
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from rss_reeder_ranker import FeedItem, FeedSource, ScoredItem, parse_feed, score_items
-from update_daily import merge_scored_history
+from rss_reeder_ranker import FeedItem, FeedSource, ScoredItem, parse_feed, score_items, write_json
+from update_daily import build_daily_digest, merge_scored_history
 
 
 def scored_item(
@@ -92,6 +94,23 @@ class IncrementalHistoryTests(unittest.TestCase):
 
         self.assertEqual(len(scored), 3)
         self.assertEqual(batch_sizes, [3, 3, 1, 2, 2, 1, 1])
+
+    def test_daily_digest_prefers_newer_high_score_article_over_older_higher_score(self) -> None:
+        older = scored_item("older", "https://example.com/older", "Tue, 04 Aug 2026 10:00:00 +0000", 99)
+        newer = scored_item("newer", "https://example.com/newer", "Wed, 05 Aug 2026 10:00:00 +0000", 75)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            write_json([older, newer], source_dir / "scored_items.json")
+
+            with mock.patch("update_daily.DAILY_DIGEST_DIR", root / "digest"), mock.patch(
+                "update_daily.source_output_dir", return_value=source_dir
+            ):
+                selected = build_daily_digest([{"name": "test", "min_score": 75}], "", limit=1)
+
+        self.assertEqual([item.item.id for item in selected], ["newer"])
 
 
 if __name__ == "__main__":

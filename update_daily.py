@@ -34,7 +34,7 @@ OUTPUT_DIR = ROOT / "output"
 DEFAULT_PUBLISH_ROOT = Path("/Users/aroc/Public/reeder-rss-root")
 DAILY_DIGEST_DIR = OUTPUT_DIR / "daily_digest"
 DEFAULT_MIN_SCORE = 75
-DEFAULT_DIGEST_LIMIT = 100
+DEFAULT_DIGEST_LIMIT = 300
 HISTORY_DAYS = 3
 INITIAL_LOOKBACK_HOURS = 48
 MAX_SOURCE_HISTORY = 500
@@ -313,7 +313,7 @@ def build_daily_digest(
 
     selected = sorted(
         by_article.values(),
-        key=lambda row: (row.score, row.item.published, row.item.id),
+        key=scored_sort_key,
         reverse=True,
     )[:limit]
     DAILY_DIGEST_DIR.mkdir(parents=True, exist_ok=True)

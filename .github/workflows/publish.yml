@@ -3,10 +3,9 @@ name: 更新并发布 Reeder RSS
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 20 * * *"
-      timezone: "Asia/Shanghai"
-    - cron: "17 23 * * *"
-      timezone: "Asia/Shanghai"
+    # GitHub cron uses UTC: 12:00/15:00 UTC = 20:00/23:00 Asia/Shanghai.
+    - cron: "0 12 * * *"
+    - cron: "0 15 * * *"
 
 permissions:
   contents: read
